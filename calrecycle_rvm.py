@@ -1,97 +1,107 @@
-import requests, csv, json, sys
-from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+import json, csv, time
 
-SESSION_URL = "https://www2.calrecycle.ca.gov/BevContainer/RecyclingCenters"
-DATA_URL    = "https://www2.calrecycle.ca.gov/BevContainer/RecyclingCenters/_RCLocatorGridData"
+URL = "https://www2.calrecycle.ca.gov/BevContainer/RecyclingCenters"
 
-session = requests.Session()
-session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"})
+print("Starting headless Chrome...")
+options = Options()
+options.add_argument("--headless")
+options.add_argument("--no-sandbox")
+options.add_argument("--disable-dev-shm-usage")
+options.add_argument("--disable-gpu")
+driver = webdriver.Chrome(options=options)
 
-print("Seeding session...")
-seed = session.get(SESSION_URL, timeout=30)
-print(f"Seed: {seed.status_code}  cookies={list(session.cookies.keys())}")
+# Intercept all XHR/fetch responses via Chrome DevTools Protocol
+driver.execute_cdp_cmd("Network.enable", {})
 
-# Print page HTML snippet to find any hidden form fields
-soup = BeautifulSoup(seed.text, "html.parser")
-print("\n--- All hidden inputs on seed page ---")
-for inp in soup.find_all("input", {"type": "hidden"}):
-    print(f"  name={inp.get('name')}  value={str(inp.get('value',''))[:40]}")
+captured = []
 
-print("\n--- All forms on seed page ---")
-for form in soup.find_all("form"):
-    print(f"  action={form.get('action')}  method={form.get('method')}")
+def response_received(response):
+    url = response.get("response", {}).get("url", "")
+    if "_RCLocatorGridData" in url:
+        request_id = response["requestId"]
+        captured.append(request_id)
 
-base_headers = {
-    "Accept": "application/json, text/javascript, */*; q=0.01",
-    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-    "X-Requested-With": "XMLHttpRequest",
-    "Referer": SESSION_URL,
-    "Origin": "https://www2.calrecycle.ca.gov",
-}
+driver.add_listener("Network.responseReceived", response_received)
 
-# Try multiple payload variations
-payloads = [
-    ("Kendo default (original)", {
-        "sort": "RecyclingLocationName-asc",
-        "page": "1", "pageSize": "25",
-        "group": "", "filter": "",
-        "hasMap": "true", "searchString": "",
-    }),
-    ("No hasMap param", {
-        "sort": "RecyclingLocationName-asc",
-        "page": "1", "pageSize": "25",
-        "group": "", "filter": "",
-        "searchString": "",
-    }),
-    ("Completely empty payload", {}),
-    ("Just page and pageSize", {
-        "page": "1", "pageSize": "25",
-    }),
-    ("camelCase variants", {
-        "Sort": "RecyclingLocationName-asc",
-        "Page": "1", "PageSize": "25",
-        "Group": "", "Filter": "",
-    }),
-]
+print(f"Loading {URL}...")
+driver.get(URL)
 
-working_payload = None
-for label, payload in payloads:
-    print(f"\n--- Trying: {label} ---")
-    r = session.post(DATA_URL, data=payload, headers=base_headers, timeout=30)
-    print(f"  Status: {r.status_code}  Body length: {len(r.text)}  CT: {r.headers.get('Content-Type','?')}")
-    if r.text.strip():
-        print(f"  Response: {r.text[:300]}")
-        working_payload = (label, payload, r)
-        break
+# Wait for the Kendo grid to load (it fires the POST automatically on page load)
+print("Waiting for grid to populate...")
+try:
+    WebDriverWait(driver, 30).until(
+        EC.presence_of_element_located((By.CSS_SELECTOR, ".k-grid-content tr"))
+    )
+    print("Grid rows appeared!")
+except:
+    print("Timed out waiting for grid rows — trying to proceed anyway")
 
-if not working_payload:
-    print("\n❌ All payload variations returned empty. Printing seed page HTML for inspection:")
-    print(seed.text[:3000])
-    sys.exit(1)
+time.sleep(3)  # Extra buffer for XHR to complete
 
-label, payload, r = working_payload
-print(f"\n✅ Working payload: {label}")
-data = r.json()
-records = data.get("Data") or data.get("data") or (data if isinstance(data, list) else [])
-print(f"Records: {len(records)}")
+# Extract data via JavaScript execution — read directly from the Kendo grid datasource
+print("Extracting data from Kendo grid datasource...")
+records = driver.execute_script("""
+    try {
+        var grid = $(".k-grid").data("kendoGrid");
+        if (!grid) return {error: "No Kendo grid found"};
+        var ds = grid.dataSource;
+        if (!ds) return {error: "No dataSource"};
+        var data = ds.data();
+        if (!data || data.length === 0) return {error: "DataSource empty", total: ds.total()};
+        return data.toJSON ? data.toJSON() : JSON.parse(JSON.stringify(data));
+    } catch(e) {
+        return {error: e.toString()};
+    }
+""")
+
+print(f"Raw result type: {type(records)}")
+
+if isinstance(records, dict) and "error" in records:
+    print(f"Grid extract error: {records}")
+    # Fallback: scrape visible rows from the DOM
+    print("Falling back to DOM scrape...")
+    rows = driver.execute_script("""
+        var rows = [];
+        document.querySelectorAll('.k-grid-content tr[role=row]').forEach(function(tr) {
+            var cells = tr.querySelectorAll('td');
+            rows.push(Array.from(cells).map(function(td){ return td.innerText.trim(); }));
+        });
+        return rows;
+    """)
+    print(f"DOM rows found: {len(rows)}")
+    print("First 3 rows:", rows[:3])
+    driver.quit()
+    exit(1)
+
+print(f"Total records from grid: {len(records)}")
 if records:
     print(f"Fields: {list(records[0].keys())}")
-    rvm = [x for x in records if x.get("HasReverseVendingMachine") is True]
-    print(f"RVM in sample: {len(rvm)}")
 
-    # Full pull
-    payload["pageSize"] = "5000"
-    r2 = session.post(DATA_URL, data=payload, headers=base_headers, timeout=60)
-    data2 = r2.json()
-    all_records = data2.get("Data") or data2.get("data") or []
-    rvm_all = [x for x in all_records if x.get("HasReverseVendingMachine") is True]
-    print(f"\nFull pull: {len(all_records)} total, {len(rvm_all)} RVM centers")
+rvm = [r for r in records if r.get("HasReverseVendingMachine") is True]
+print(f"RVM centers: {len(rvm)}")
 
-    fields = list(rvm_all[0].keys()) if rvm_all else list(all_records[0].keys())
-    with open("calrecycle_rvm.csv", "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
-        w.writeheader()
-        w.writerows(rvm_all)
-    with open("calrecycle_rvm.json", "w", encoding="utf-8") as f:
-        json.dump(rvm_all, f, indent=2)
-    print(f"✅ Saved {len(rvm_all)} RVM centers to CSV and JSON.")
+if not rvm:
+    print("No RVM=true found. Checking field names...")
+    sample = records[0] if records else {}
+    rvm_keys = [k for k in sample if "vend" in k.lower() or "rvm" in k.lower() or "machine" in k.lower()]
+    print(f"RVM-related fields: {rvm_keys}")
+    print("Sample record:", json.dumps(sample, indent=2)[:500])
+    driver.quit()
+    exit(1)
+
+fields = list(rvm[0].keys())
+with open("calrecycle_rvm.csv", "w", newline="", encoding="utf-8") as f:
+    w = csv.DictWriter(f, fieldnames=fields)
+    w.writeheader()
+    w.writerows(rvm)
+
+with open("calrecycle_rvm.json", "w", encoding="utf-8") as f:
+    json.dump(rvm, f, indent=2)
+
+print(f"\n✅ Saved {len(rvm)} RVM centers to calrecycle_rvm.csv and calrecycle_rvm.json")
+driver.quit()
