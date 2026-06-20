@@ -1,0 +1,25 @@
+name: CalRecycle RVM Extractor
+
+on:
+  workflow_dispatch:
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: pip install requests beautifulsoup4
+      - name: Run extractor
+        run: python calrecycle_rvm.py
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: calrecycle-rvm-results
+          path: |
+            calrecycle_rvm.csv
+            calrecycle_rvm.json
+          retention-days: 30
