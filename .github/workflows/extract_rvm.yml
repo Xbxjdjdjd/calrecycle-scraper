@@ -1,0 +1,36 @@
+name: CalRecycle RVM Extractor
+
+on:
+  workflow_dispatch:
+
+jobs:
+  extract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Chrome
+        run: |
+          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
+          sudo sh -c 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list'
+          sudo apt-get update
+          sudo apt-get install -y google-chrome-stable
+
+      - name: Install Python dependencies
+        run: pip install selenium webdriver-manager
+
+      - name: Run extractor
+        run: python calrecycle_rvm.py
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: calrecycle-rvm-results
+          path: |
+            calrecycle_rvm.csv
+            calrecycle_rvm.json
+          retention-days: 30
