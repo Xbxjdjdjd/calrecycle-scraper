@@ -1,141 +1,115 @@
-import requests, csv, json, sys, time
+import requests, csv, json, sys
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-SESSION_URL  = "https://www2.calrecycle.ca.gov/BevContainer/RecyclingCenters"
-GRID_URL     = "https://www2.calrecycle.ca.gov/BevContainer/RecyclingCenters/_RCLocatorGridData"
-DETAIL_URL   = "https://www2.calrecycle.ca.gov/BevContainer/RecyclingCenters/Details"
-OUTPUT_CSV   = "calrecycle_rvm.csv"
-OUTPUT_JSON  = "calrecycle_rvm.json"
+BASE = "https://www2.calrecycle.ca.gov"
+SESSION_URL = f"{BASE}/BevContainer/RecyclingCenters"
+GRID_URL    = f"{BASE}/BevContainer/RecyclingCenters/_RCLocatorGridData"
+DETAIL_URL  = f"{BASE}/BevContainer/RecyclingCenters/Details"
+OUTPUT_CSV  = "calrecycle_rvm.csv"
+OUTPUT_JSON = "calrecycle_rvm.json"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "application/json, text/javascript, */*; q=0.01",
+    "X-Requested-With": "XMLHttpRequest",
     "Referer": SESSION_URL,
 }
 
-# ── Step 1: Get all AccountLocationIDs from grid ─────────────────────────────
-print("Step 1: Seeding session...")
 session = requests.Session()
 session.headers.update({"User-Agent": HEADERS["User-Agent"]})
+
+print("Seeding session...")
 seed = session.get(SESSION_URL, timeout=30)
 print(f"  Seed: {seed.status_code}  cookies={list(session.cookies.keys())}")
 
-print("Step 1b: Fetching grid data (all centers)...")
-grid_headers = {
-    **HEADERS,
-    "Accept": "application/json, text/javascript, */*; q=0.01",
-    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-    "X-Requested-With": "XMLHttpRequest",
+# Use GET with RCLocatorGrid- prefixed params
+print("Fetching grid data via GET...")
+params = {
+    "RCLocatorGrid-sort": "RecyclingLocationName-asc",
+    "RCLocatorGrid-page": "1",
+    "RCLocatorGrid-pageSize": "5000",
+    "RCLocatorGrid-group": "",
+    "RCLocatorGrid-filter": "",
 }
-payload = {
-    "sort": "RecyclingLocationName-asc",
-    "page": "1", "pageSize": "5000",
-    "group": "", "filter": "",
-    "hasMap": "false", "searchString": "",
-}
-r = session.post(GRID_URL, data=payload, headers=grid_headers, timeout=60)
-print(f"  Grid response: {r.status_code}  length={len(r.text)}  CT={r.headers.get('Content-Type')}")
+r = session.get(GRID_URL, params=params, headers=HEADERS, timeout=60)
+print(f"  Response: {r.status_code}  length={len(r.text)}  CT={r.headers.get('Content-Type')}")
+print(f"  Raw (first 300): {r.text[:300]}")
 
-if not r.text.strip():
-    print("  Grid returned empty — trying hasMap=true...")
-    payload["hasMap"] = "true"
-    r = session.post(GRID_URL, data=payload, headers=grid_headers, timeout=60)
+if not r.text.strip() or "json" not in r.headers.get("Content-Type", ""):
+    print("Still empty — trying without prefix...")
+    params2 = {
+        "sort": "RecyclingLocationName-asc",
+        "page": "1",
+        "pageSize": "5000",
+        "group": "",
+        "filter": "",
+    }
+    r = session.get(GRID_URL, params=params2, headers=HEADERS, timeout=60)
     print(f"  Retry: {r.status_code}  length={len(r.text)}")
+    print(f"  Raw (first 300): {r.text[:300]}")
 
 if not r.text.strip():
-    print("ERROR: Grid still empty. Cannot continue.")
+    print("ERROR: Grid still empty.")
     sys.exit(1)
 
 data = r.json()
 centers = data.get("Data") or data.get("data") or (data if isinstance(data, list) else [])
-print(f"  Total centers: {len(centers)}")
+print(f"Total centers: {len(centers)}")
+if centers:
+    print(f"Fields: {list(centers[0].keys())}")
+
 if not centers:
-    print("  No centers found. Raw:", r.text[:300])
     sys.exit(1)
 
-# Extract IDs — try common field names
-sample = centers[0]
-print(f"  Fields: {list(sample.keys())}")
-id_field = None
-for f in ["AccountLocationID", "accountLocationID", "LocationId", "Id", "ID"]:
-    if f in sample:
-        id_field = f
-        break
-if not id_field:
-    print(f"  Can't find ID field. Sample: {json.dumps(sample, indent=2)[:500]}")
-    sys.exit(1)
-print(f"  Using ID field: {id_field}")
-
+# Find ID field
+id_field = next((f for f in ["AccountLocationID","LocationId","Id","ID"] if f in centers[0]), None)
+print(f"ID field: {id_field}")
 ids = [c[id_field] for c in centers if c.get(id_field)]
-print(f"  Got {len(ids)} IDs to scrape")
+print(f"Got {len(ids)} IDs. Sample: {ids[:5]}")
 
-# ── Step 2: Scrape detail pages ───────────────────────────────────────────────
-print(f"\nStep 2: Scraping {len(ids)} detail pages (threaded, 10 workers)...")
+# Scrape detail pages
+print(f"\nScraping {len(ids)} detail pages...")
 
-def scrape_detail(loc_id):
+def scrape(loc_id):
     try:
-        url = f"{DETAIL_URL}?AccountLocationID={loc_id}"
-        r = session.get(url, headers=HEADERS, timeout=20)
+        r = session.get(f"{DETAIL_URL}?AccountLocationID={loc_id}", timeout=15)
         soup = BeautifulSoup(r.text, "html.parser")
-        
-        # Find "Reverse Vending Machines:" label and get the next text
+        h1 = soup.find("h1")
+        if not h1 or "Details for" not in h1.text:
+            return None
+        name = h1.text.replace("Recycling Center Details for", "").strip()
         rvm = None
         for b in soup.find_all("b"):
             if "Reverse Vending" in b.text:
-                # Value is the next sibling text
-                sibling = b.next_sibling
-                if sibling:
-                    rvm = sibling.strip()
+                sib = b.next_sibling
+                if sib:
+                    rvm = sib.strip()
                 break
-        
-        # Also grab name, address, city, zip, phone while we're here
-        name = soup.find("h1")
-        name = name.text.replace("Recycling Center Details for", "").strip() if name else ""
-        
-        return {
-            "AccountLocationID": loc_id,
-            "Name": name,
-            "HasRVM": rvm,
-            "URL": url,
-        }
-    except Exception as e:
-        return {"AccountLocationID": loc_id, "HasRVM": None, "Error": str(e)}
+        return {"AccountLocationID": loc_id, "Name": name, "HasRVM": rvm}
+    except:
+        return None
 
 results = []
-with ThreadPoolExecutor(max_workers=10) as executor:
-    futures = {executor.submit(scrape_detail, lid): lid for lid in ids}
-    for i, future in enumerate(as_completed(futures)):
-        results.append(future.result())
-        if (i+1) % 50 == 0:
-            print(f"  Scraped {i+1}/{len(ids)}...")
+with ThreadPoolExecutor(max_workers=15) as ex:
+    futures = {ex.submit(scrape, i): i for i in ids}
+    for n, f in enumerate(as_completed(futures)):
+        r = f.result()
+        if r:
+            results.append(r)
+        if (n+1) % 100 == 0:
+            print(f"  {n+1}/{len(ids)} checked, {len(results)} valid so far...")
 
-print(f"  Done scraping. Total results: {len(results)}")
-
-# Filter RVM=Yes
 rvm_centers = [r for r in results if (r.get("HasRVM") or "").strip().lower() == "yes"]
-print(f"  Centers with RVM=Yes: {len(rvm_centers)}")
+print(f"\nTotal valid centers: {len(results)}  RVM=Yes: {len(rvm_centers)}")
+print(f"RVM values seen: {set(r.get('HasRVM') for r in results[:30])}")
 
-# Sample of what we got
-print(f"  Sample result: {results[0] if results else 'none'}")
-print(f"  RVM values seen: {set(r.get('HasRVM') for r in results[:20])}")
-
-if not rvm_centers:
-    print("  No RVM centers found. Check HasRVM values above.")
-    # Save all results anyway for debugging
-    with open("calrecycle_all.json", "w") as f:
-        json.dump(results[:50], f, indent=2)
-    sys.exit(1)
-
-# ── Step 3: Save outputs ──────────────────────────────────────────────────────
-fields = list(rvm_centers[0].keys())
 with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
-    w = csv.DictWriter(f, fieldnames=fields)
+    w = csv.DictWriter(f, fieldnames=["AccountLocationID","Name","HasRVM"])
     w.writeheader()
     w.writerows(rvm_centers)
 
 with open(OUTPUT_JSON, "w", encoding="utf-8") as f:
     json.dump(rvm_centers, f, indent=2)
 
-print(f"\n✅ Done! Saved {len(rvm_centers)} RVM centers → {OUTPUT_CSV}")
+print(f"✅ Saved {len(rvm_centers)} RVM centers.")
