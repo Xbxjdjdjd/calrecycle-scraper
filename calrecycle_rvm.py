@@ -15,23 +15,9 @@ options.add_argument("--disable-dev-shm-usage")
 options.add_argument("--disable-gpu")
 driver = webdriver.Chrome(options=options)
 
-# Intercept all XHR/fetch responses via Chrome DevTools Protocol
-driver.execute_cdp_cmd("Network.enable", {})
-
-captured = []
-
-def response_received(response):
-    url = response.get("response", {}).get("url", "")
-    if "_RCLocatorGridData" in url:
-        request_id = response["requestId"]
-        captured.append(request_id)
-
-driver.add_listener("Network.responseReceived", response_received)
-
 print(f"Loading {URL}...")
 driver.get(URL)
 
-# Wait for the Kendo grid to load (it fires the POST automatically on page load)
 print("Waiting for grid to populate...")
 try:
     WebDriverWait(driver, 30).until(
@@ -41,9 +27,8 @@ try:
 except:
     print("Timed out waiting for grid rows — trying to proceed anyway")
 
-time.sleep(3)  # Extra buffer for XHR to complete
+time.sleep(3)
 
-# Extract data via JavaScript execution — read directly from the Kendo grid datasource
 print("Extracting data from Kendo grid datasource...")
 records = driver.execute_script("""
     try {
@@ -63,7 +48,6 @@ print(f"Raw result type: {type(records)}")
 
 if isinstance(records, dict) and "error" in records:
     print(f"Grid extract error: {records}")
-    # Fallback: scrape visible rows from the DOM
     print("Falling back to DOM scrape...")
     rows = driver.execute_script("""
         var rows = [];
@@ -103,5 +87,5 @@ with open("calrecycle_rvm.csv", "w", newline="", encoding="utf-8") as f:
 with open("calrecycle_rvm.json", "w", encoding="utf-8") as f:
     json.dump(rvm, f, indent=2)
 
-print(f"\n✅ Saved {len(rvm)} RVM centers to calrecycle_rvm.csv and calrecycle_rvm.json")
+print(f"Done! Saved {len(rvm)} RVM centers.")
 driver.quit()
