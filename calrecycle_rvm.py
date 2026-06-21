@@ -23,43 +23,28 @@ print(f"Loading {URL}...")
 driver.get(URL)
 time.sleep(5)
 
-# Print all buttons and links to find the search trigger
-print("Buttons on page:")
-buttons = driver.find_elements(By.TAG_NAME, "button")
-for b in buttons:
-    print(f"  button: id={b.get_attribute('id')} class={b.get_attribute('class')} text={b.text[:50]}")
+# Type a broad search and click the map search button (id=mapSearch)
+print("Filling in location and clicking map search...")
+try:
+    location_input = driver.find_element(By.ID, "Location")
+    location_input.clear()
+    location_input.send_keys("CA")
+    print("Typed 'CA' into location field")
+except Exception as e:
+    print(f"Couldn't fill location: {e}")
 
-print("Input elements:")
-inputs = driver.find_elements(By.TAG_NAME, "input")
-for i in inputs:
-    print(f"  input: id={i.get_attribute('id')} type={i.get_attribute('type')} value={i.get_attribute('value')} placeholder={i.get_attribute('placeholder')}")
+try:
+    search_btn = driver.find_element(By.ID, "mapSearch")
+    driver.execute_script("arguments[0].click();", search_btn)
+    print("Clicked mapSearch button")
+except Exception as e:
+    print(f"Couldn't click mapSearch: {e}")
 
-print("Trying to trigger grid by clicking search/locate button...")
-triggered = False
-for b in buttons:
-    bid = (b.get_attribute('id') or '').lower()
-    btext = (b.text or '').lower()
-    bclass = (b.get_attribute('class') or '').lower()
-    if any(x in bid+btext+bclass for x in ['search', 'locat', 'find', 'submit', 'go', 'show']):
-        print(f"  Clicking: {b.get_attribute('id')} / {b.text}")
-        try:
-            driver.execute_script("arguments[0].click();", b)
-            triggered = True
-            time.sleep(10)
-            break
-        except Exception as e:
-            print(f"  Click failed: {e}")
+print("Waiting 15s for grid XHR to fire...")
+time.sleep(15)
 
-if not triggered:
-    print("No obvious button found — trying to trigger grid via JS directly...")
-    driver.execute_script("""
-        var grid = $(".k-grid").data("kendoGrid");
-        if (grid) { grid.dataSource.read(); }
-    """)
-    time.sleep(10)
-
-# Check network logs for the grid call
-print("Scanning network logs...")
+# Scan performance logs for the grid call
+print("Scanning network logs for _RCLocatorGridData...")
 logs = driver.get_log("performance")
 grid_request_id = None
 for entry in logs:
@@ -68,19 +53,16 @@ for entry in logs:
         url = msg["params"]["response"]["url"]
         if "_RCLocatorGridData" in url:
             grid_request_id = msg["params"]["requestId"]
-            print(f"Found _RCLocatorGridData! request_id={grid_request_id}")
+            print(f"Found it! request_id={grid_request_id}")
 
 if not grid_request_id:
-    print("Still no grid XHR. All CalRecycle URLs now seen:")
+    print("Still no grid XHR. All CalRecycle URLs seen after click:")
     for entry in logs:
         msg = json.loads(entry["message"])["message"]
         if msg.get("method") == "Network.responseReceived":
             url = msg["params"]["response"]["url"]
             if "calrecycle" in url.lower():
                 print(f"  {url}")
-    # Last resort: dump page source to see what's actually there
-    print("\nPage source snippet (3000 chars):")
-    print(driver.page_source[:3000])
     driver.quit()
     exit(1)
 
@@ -88,6 +70,8 @@ body = driver.execute_cdp_cmd("Network.getResponseBody", {"requestId": grid_requ
 grid_response = json.loads(body["body"])
 records = grid_response.get("Data") or grid_response.get("data") or (grid_response if isinstance(grid_response, list) else [])
 print(f"Total records: {len(records)}")
+if records:
+    print(f"Fields: {list(records[0].keys())}")
 
 rvm = [r for r in records if r.get("HasReverseVendingMachine") is True]
 print(f"RVM centers: {len(rvm)}")
