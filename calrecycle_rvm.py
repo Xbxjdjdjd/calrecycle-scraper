@@ -1,8 +1,5 @@
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 import json, csv, time
 
 URL = "https://www2.calrecycle.ca.gov/BevContainer/RecyclingCenters"
@@ -23,52 +20,52 @@ print(f"Loading {URL}...")
 driver.get(URL)
 time.sleep(5)
 
-# Type a broad search and click the map search button (id=mapSearch)
-print("Filling in location and clicking map search...")
-try:
-    location_input = driver.find_element(By.ID, "Location")
-    location_input.clear()
-    location_input.send_keys("CA")
-    print("Typed 'CA' into location field")
-except Exception as e:
-    print(f"Couldn't fill location: {e}")
+# Get cookies from the seeded session to use in our fetch call
+cookies = driver.get_cookies()
+cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies])
+print(f"Session cookies: {[c['name'] for c in cookies]}")
 
-try:
-    search_btn = driver.find_element(By.ID, "mapSearch")
-    driver.execute_script("arguments[0].click();", search_btn)
-    print("Clicked mapSearch button")
-except Exception as e:
-    print(f"Couldn't click mapSearch: {e}")
+# Use the page's own jQuery/fetch to make the POST from within the page context
+# This way it inherits all session state, headers, tokens automatically
+print("Triggering _RCLocatorGridData via in-page fetch...")
+result = driver.execute_script("""
+    return new Promise((resolve) => {
+        $.ajax({
+            url: '/BevContainer/RecyclingCenters/_RCLocatorGridData',
+            method: 'POST',
+            data: {
+                sort: 'RecyclingLocationName-asc',
+                page: 1,
+                pageSize: 5000,
+                group: '',
+                filter: '',
+                hasMap: 'true',
+                searchString: ''
+            },
+            headers: {
+                'X-Requested-With': 'XMLHttpRequest'
+            },
+            success: function(data) { resolve({ok: true, data: data}); },
+            error: function(xhr, status, err) {
+                resolve({ok: false, status: xhr.status, text: xhr.responseText.substring(0, 500), err: err});
+            }
+        });
+    });
+""")
 
-print("Waiting 15s for grid XHR to fire...")
-time.sleep(15)
+print(f"Ajax result ok={result.get('ok')}")
 
-# Scan performance logs for the grid call
-print("Scanning network logs for _RCLocatorGridData...")
-logs = driver.get_log("performance")
-grid_request_id = None
-for entry in logs:
-    msg = json.loads(entry["message"])["message"]
-    if msg.get("method") == "Network.responseReceived":
-        url = msg["params"]["response"]["url"]
-        if "_RCLocatorGridData" in url:
-            grid_request_id = msg["params"]["requestId"]
-            print(f"Found it! request_id={grid_request_id}")
-
-if not grid_request_id:
-    print("Still no grid XHR. All CalRecycle URLs seen after click:")
-    for entry in logs:
-        msg = json.loads(entry["message"])["message"]
-        if msg.get("method") == "Network.responseReceived":
-            url = msg["params"]["response"]["url"]
-            if "calrecycle" in url.lower():
-                print(f"  {url}")
+if not result.get('ok'):
+    print(f"Ajax failed: status={result.get('status')} err={result.get('err')}")
+    print(f"Response text: {result.get('text')}")
     driver.quit()
     exit(1)
 
-body = driver.execute_cdp_cmd("Network.getResponseBody", {"requestId": grid_request_id})
-grid_response = json.loads(body["body"])
-records = grid_response.get("Data") or grid_response.get("data") or (grid_response if isinstance(grid_response, list) else [])
+data = result.get('data')
+if isinstance(data, str):
+    data = json.loads(data)
+
+records = data.get("Data") or data.get("data") or (data if isinstance(data, list) else [])
 print(f"Total records: {len(records)}")
 if records:
     print(f"Fields: {list(records[0].keys())}")
