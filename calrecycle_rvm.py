@@ -1,3 +1,4 @@
+# VERSION: COOKIE-HARVEST-V1
 import requests, csv, json, sys
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
