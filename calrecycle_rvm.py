@@ -13,7 +13,7 @@ DETAIL_URL  = f"{BASE}/BevContainer/RecyclingCenters/Details"
 OUTPUT_CSV  = "calrecycle_rvm.csv"
 OUTPUT_JSON = "calrecycle_rvm.json"
 ID_START    = 1
-ID_END      = 60000
+ID_END      = 100000
 
 # Step 1: Harvest cookies via Selenium
 print("Step 1: Launching browser to harvest cookies...")
