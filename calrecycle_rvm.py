@@ -2,18 +2,23 @@ import requests, csv, json, sys
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-BASE = "https://www2.calrecycle.ca.gov"
+BASE        = "https://www2.calrecycle.ca.gov"
 SESSION_URL = f"{BASE}/BevContainer/RecyclingCenters"
 GRID_URL    = f"{BASE}/BevContainer/RecyclingCenters/_RCLocatorGridData"
 DETAIL_URL  = f"{BASE}/BevContainer/RecyclingCenters/Details"
 OUTPUT_CSV  = "calrecycle_rvm.csv"
 OUTPUT_JSON = "calrecycle_rvm.json"
 
+# All 58 California counties (IDs from the page source dropdown)
+COUNTY_IDS = list(range(1, 59))
+
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36",
     "Accept": "application/json, text/javascript, */*; q=0.01",
+    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
     "X-Requested-With": "XMLHttpRequest",
     "Referer": SESSION_URL,
+    "Origin": BASE,
 }
 
 session = requests.Session()
@@ -23,53 +28,92 @@ print("Seeding session...")
 seed = session.get(SESSION_URL, timeout=30)
 print(f"  Seed: {seed.status_code}  cookies={list(session.cookies.keys())}")
 
-# Use GET with RCLocatorGrid- prefixed params
-print("Fetching grid data via GET...")
-params = {
-    "RCLocatorGrid-sort": "RecyclingLocationName-asc",
-    "RCLocatorGrid-page": "1",
-    "RCLocatorGrid-pageSize": "5000",
-    "RCLocatorGrid-group": "",
-    "RCLocatorGrid-filter": "",
+# Test with county 1 (Alameda) first
+print("\nTesting with CountyID=1 (Alameda)...")
+test_payload = {
+    "sort": "RecyclingLocationName-asc",
+    "page": "1", "pageSize": "500",
+    "group": "", "filter": "",
+    "CountyID": "1",
+    "searchString": "",
 }
-r = session.get(GRID_URL, params=params, headers=HEADERS, timeout=60)
-print(f"  Response: {r.status_code}  length={len(r.text)}  CT={r.headers.get('Content-Type')}")
-print(f"  Raw (first 300): {r.text[:300]}")
-
-if not r.text.strip() or "json" not in r.headers.get("Content-Type", ""):
-    print("Still empty — trying without prefix...")
-    params2 = {
-        "sort": "RecyclingLocationName-asc",
-        "page": "1",
-        "pageSize": "5000",
-        "group": "",
-        "filter": "",
-    }
-    r = session.get(GRID_URL, params=params2, headers=HEADERS, timeout=60)
-    print(f"  Retry: {r.status_code}  length={len(r.text)}")
-    print(f"  Raw (first 300): {r.text[:300]}")
+r = session.post(GRID_URL, data=test_payload, headers=HEADERS, timeout=30)
+print(f"  Status: {r.status_code}  length={len(r.text)}  CT={r.headers.get('Content-Type')}")
+print(f"  Raw (first 200): {r.text[:200]}")
 
 if not r.text.strip():
-    print("ERROR: Grid still empty.")
+    # Try with hasMap and CountyID
+    print("  Empty — trying with hasMap=false and CountyID...")
+    test_payload["hasMap"] = "false"
+    r = session.post(GRID_URL, data=test_payload, headers=HEADERS, timeout=30)
+    print(f"  Status: {r.status_code}  length={len(r.text)}")
+    print(f"  Raw: {r.text[:200]}")
+
+if not r.text.strip():
+    # Try GET with CountyID
+    print("  Still empty — trying GET with CountyID...")
+    r = session.get(GRID_URL, params=test_payload, headers=HEADERS, timeout=30)
+    print(f"  GET Status: {r.status_code}  length={len(r.text)}")
+    print(f"  Raw: {r.text[:200]}")
+
+if not r.text.strip():
+    print("ERROR: Still empty. Printing all cookies and headers for debugging:")
+    print(f"  Cookies: {dict(session.cookies)}")
     sys.exit(1)
 
+# If we got data, parse it
 data = r.json()
 centers = data.get("Data") or data.get("data") or (data if isinstance(data, list) else [])
-print(f"Total centers: {len(centers)}")
+print(f"\n✅ Got {len(centers)} centers for Alameda county!")
 if centers:
     print(f"Fields: {list(centers[0].keys())}")
+    print(f"Sample: {json.dumps(centers[0], indent=2)[:400]}")
 
-if not centers:
+# Now fetch all counties
+print(f"\nFetching all 58 counties...")
+all_centers = []
+working_payload = {k: v for k, v in test_payload.items()}
+
+for county_id in COUNTY_IDS:
+    working_payload["CountyID"] = str(county_id)
+    working_payload["page"] = "1"
+    working_payload["pageSize"] = "1000"
+    try:
+        if r.request.method == "GET":
+            resp = session.get(GRID_URL, params=working_payload, headers=HEADERS, timeout=30)
+        else:
+            resp = session.post(GRID_URL, data=working_payload, headers=HEADERS, timeout=30)
+        if resp.text.strip():
+            d = resp.json()
+            c = d.get("Data") or d.get("data") or (d if isinstance(d, list) else [])
+            all_centers.extend(c)
+            print(f"  County {county_id}: {len(c)} centers")
+        else:
+            print(f"  County {county_id}: empty")
+    except Exception as e:
+        print(f"  County {county_id}: error {e}")
+
+print(f"\nTotal centers across all counties: {len(all_centers)}")
+id_field = next((f for f in ["AccountLocationID","LocationId","Id","ID"] if f in (all_centers[0] if all_centers else {})), None)
+print(f"ID field: {id_field}")
+
+if not id_field or not all_centers:
     sys.exit(1)
 
-# Find ID field
-id_field = next((f for f in ["AccountLocationID","LocationId","Id","ID"] if f in centers[0]), None)
-print(f"ID field: {id_field}")
-ids = [c[id_field] for c in centers if c.get(id_field)]
-print(f"Got {len(ids)} IDs. Sample: {ids[:5]}")
+# Deduplicate
+seen = set()
+unique_centers = []
+for c in all_centers:
+    cid = c.get(id_field)
+    if cid not in seen:
+        seen.add(cid)
+        unique_centers.append(c)
+print(f"Unique centers: {len(unique_centers)}")
+ids = [c[id_field] for c in unique_centers]
+print(f"Sample IDs: {ids[:10]}")
 
-# Scrape detail pages
-print(f"\nScraping {len(ids)} detail pages...")
+# Scrape detail pages for RVM status
+print(f"\nScraping {len(ids)} detail pages for RVM status...")
 
 def scrape(loc_id):
     try:
@@ -94,15 +138,14 @@ results = []
 with ThreadPoolExecutor(max_workers=15) as ex:
     futures = {ex.submit(scrape, i): i for i in ids}
     for n, f in enumerate(as_completed(futures)):
-        r = f.result()
-        if r:
-            results.append(r)
+        r2 = f.result()
+        if r2:
+            results.append(r2)
         if (n+1) % 100 == 0:
-            print(f"  {n+1}/{len(ids)} checked, {len(results)} valid so far...")
+            print(f"  {n+1}/{len(ids)} done, {len(results)} valid...")
 
 rvm_centers = [r for r in results if (r.get("HasRVM") or "").strip().lower() == "yes"]
-print(f"\nTotal valid centers: {len(results)}  RVM=Yes: {len(rvm_centers)}")
-print(f"RVM values seen: {set(r.get('HasRVM') for r in results[:30])}")
+print(f"\nTotal valid: {len(results)}  RVM=Yes: {len(rvm_centers)}")
 
 with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
     w = csv.DictWriter(f, fieldnames=["AccountLocationID","Name","HasRVM"])
