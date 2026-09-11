@@ -30,6 +30,5 @@ jobs:
             calrecycle_rvm.csv
             calrecycle_rvm.json
             calrecycle_all_centers.json
-            screenshot_browser.png
-            debug_html_id361.html
+            discovered_ids.json
           retention-days: 30
